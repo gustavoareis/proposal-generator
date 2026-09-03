@@ -34,6 +34,34 @@ def parse_float(val) -> float:
   return float(clean) if clean else 0.0
 
 
+def parse_valor_mesclado(val) -> float:
+  """Extrai o primeiro valor monetário (0.000,00) de uma célula.
+
+  Em algumas notas o pdfplumber mescla várias colunas numéricas em uma só
+  célula de tabela (ex: 'VALOR TOTAL', 'B.CALC. ICMS' etc. viram
+  '1.350,75 0,00 0,00 0,00 0,00'). Nesses casos usamos apenas o primeiro
+  valor, que corresponde à coluna desejada.
+  """
+  texto = str(val or "")
+  if m := re.search(r"-?\d{1,3}(?:\.\d{3})*,\d{2}", texto):
+    return parse_float(m.group(0))
+  return parse_float(texto)
+
+
+def parece_codigo_item(valor) -> bool:
+  """Identifica se a célula é um código de item de tabela (linha de dado).
+
+  Aceita tanto códigos totalmente numéricos ('2000000000576') quanto
+  códigos com separadores, como '2-2' ou '12.3' (comuns em notas de
+  combustível/serviço), mas rejeita células de cabeçalho como
+  'COD.\\nPROD.'.
+  """
+  texto = str(valor or "").strip()
+  if not texto:
+    return False
+  return bool(re.fullmatch(r"\d+([./\-]\d+)*", texto))
+
+
 def format_brl(val: float) -> str:
   return f"{val:,.2f}".translate(str.maketrans(",.", ".,"))
 
@@ -77,23 +105,40 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
     for page in pdf.pages:
       for table in page.extract_tables():
         for row in table:
-          if row and len(row) >= 9 and str(row[0]).isdigit():
+          if row and len(row) >= 9 and parece_codigo_item(row[0]):
             try:
+              descricao = re.sub(r"\s+", " ", str(row[1] or "").replace("\n", " ")).strip()
+              # Remove nota legal (ex: "ICMS monofásico...Convênio ICMS...")
+              # que às vezes fica colada na descrição por quebra de linha na tabela do PDF.
+              descricao = re.split(r"\s+ICMS monofásico", descricao, flags=re.IGNORECASE)[0].strip()
               dados["itens"].append({
-                  "descricao": str(row[1] or "").replace("\n", " "),
+                  "descricao": descricao,
                   "und": str(row[5] or ""),
                   "qtd": parse_float(row[6]),
                   "vlr_unit": parse_float(row[7]),
-                  "vlr_total": parse_float(row[8]),
+                  "vlr_total": parse_valor_mesclado(row[8]),
               })
             except (ValueError, TypeError):
               continue
 
   # Extração de cabeçalho via Regex
-  if m := re.search(r"Nº\s*(\d+)", txt_extraido):
-    dados["numero_nf"] = m.group(1)
-  if m := re.search(r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})|(\d{2}/\d{2}/\d{4})", txt_extraido):
-    dados["data_emissao"] = datetime.strptime(m.group(1) or m.group(2), "%d/%m/%Y")
+  if m := re.search(r"Nº[:\s]*([\d.]+)", txt_extraido):
+    numero_limpo = m.group(1).replace(".", "").lstrip("0")
+    dados["numero_nf"] = numero_limpo or "0"
+
+  # A data de emissão fica na linha seguinte ao cabeçalho "DATA DE/DA EMISSÃO",
+  # na mesma posição relativa (última data da linha de valores).
+  linhas_txt = txt_extraido.split("\n")
+  data_encontrada = False
+  for i, linha in enumerate(linhas_txt):
+    if re.search(r"DATA D[AE] EMISS[ÃA]O", linha, re.IGNORECASE) and i + 1 < len(linhas_txt):
+      if datas := re.findall(r"\d{2}/\d{2}/\d{4}", linhas_txt[i + 1]):
+        dados["data_emissao"] = datetime.strptime(datas[-1], "%d/%m/%Y")
+        data_encontrada = True
+      break
+  if not data_encontrada and (m := re.search(r"\d{2}/\d{2}/\d{4}", txt_extraido)):
+    dados["data_emissao"] = datetime.strptime(m.group(0), "%d/%m/%Y")
+
   if m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
     dados["cnpj"] = m.group(1).strip()
   if m := re.search(r"OBS:\s*([^\n]+)", txt_extraido, re.IGNORECASE):

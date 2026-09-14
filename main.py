@@ -230,16 +230,123 @@ def extrair_dados_pdf_servico(txt_extraido: str) -> dict:
 
   return dados
 
+def extrair_dados_pdf_danfse(txt_extraido: str) -> dict:
+  """Extrai dados do Documento Auxiliar da NFS-e (DANFSe v2.0) - modelo nacional.
+
+  Layout diferente da NFS-e "antiga": não há "DISCRIMINAÇÃO DOS SERVIÇOS" nem
+  "DADOS DO TOMADOR DE SERVIÇOS". O item de serviço fica descrito no bloco
+  "Descrição do Serviço", dentro da seção "SERVIÇO PRESTADO", e o tomador
+  fica na seção "TOMADOR/ADQUIRENTE".
+  """
+  dados = {
+      "numero_nf": "000",
+      "cliente": "",
+      "cnpj": "",
+      "data_emissao": datetime.now(),
+      "itens": [],
+      "obs": "",
+  }
+
+  # 1. Número da NFS-e (primeiro valor da linha logo após o cabeçalho)
+  if m := re.search(r"NÚMERO DA NFS-E[^\n]*\n(\d+)", txt_extraido):
+      dados["numero_nf"] = m.group(1)
+
+  # 2. Data de Emissão: a linha traz [número | competência | emissão | hora];
+  # pegamos a data associada ao horário (emissão), não a da competência.
+  if m := re.search(
+      r"NÚMERO DA NFS-E[^\n]*\n\d+\s+\d{2}/\d{2}/\d{4}\s+(\d{2}/\d{2}/\d{4})\s+\d{2}:\d{2}:\d{2}",
+      txt_extraido,
+  ):
+      dados["data_emissao"] = datetime.strptime(m.group(1), "%d/%m/%Y")
+  elif m := re.search(r"(\d{2}/\d{2}/\d{4})", txt_extraido):
+      dados["data_emissao"] = datetime.strptime(m.group(1), "%d/%m/%Y")
+
+  # 3. Município do documento, usado para "limpar" a linha de nome do tomador
+  # (nas colunas mescladas o município/UF/CEP ficam colados ao nome).
+  municipio_doc = ""
+  if m := re.search(r"Município:\s*([A-ZÀ-Ü\s]+/[A-Z]{2})", txt_extraido):
+      municipio_doc = m.group(1).strip()
+
+  # 4. Bloco do Tomador/Adquirente (CNPJ e Nome)
+  bloco_tomador = ""
+  if m := re.search(
+      r"TOMADOR/ADQUIRENTE(.*?)(?=DESTINATÁRIO DA OPERAÇÃO|SERVIÇO PRESTADO|$)",
+      txt_extraido,
+      re.DOTALL,
+  ):
+      bloco_tomador = m.group(1)
+
+  if m := re.search(
+      r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})", bloco_tomador
+  ):
+      dados["cnpj"] = m.group(1)
+
+  if m := re.search(r"Nome/Nome Empresarial[^\n]*\n([^\n]+)", bloco_tomador):
+      nome_linha = m.group(1).strip()
+      if municipio_doc and municipio_doc in nome_linha:
+          nome_linha = nome_linha.split(municipio_doc)[0].strip()
+      else:
+          nome_linha = re.sub(r"\s+\S+/[A-Z]{2}\s+[\d./\-]+$", "", nome_linha).strip()
+      dados["cliente"] = nome_linha
+
+  # 5. Descrição do Serviço (item único da nota)
+  descricao_limpa = "PRESTAÇÃO DE SERVIÇOS"
+  if m := re.search(
+      r"Descrição do Serviço\n(.*?)\nTRIBUTAÇÃO MUNICIPAL", txt_extraido, re.DOTALL
+  ):
+      descricao_bruta = re.sub(r"\s+", " ", m.group(1).replace("\n", " ")).strip()
+      # Remove textos dinâmicos como "NO VALOR DE R$ 2.098,00" da descrição
+      descricao_bruta = re.sub(
+          r"\s*NO VALOR DE R\$\s*[\d.,]+", "", descricao_bruta, flags=re.IGNORECASE
+      ).strip()
+      if descricao_bruta:
+          descricao_limpa = descricao_bruta
+
+  # 6. Valor Líquido da NFS-e (coluna 2 da linha de totais, entre os 4 valores
+  # de "Total das Retenções | VALOR LÍQUIDO DA NFS-e | Total do IBS/CBS | ...")
+  vlr_total = 0.0
+  if m := re.search(
+      r"VALOR LÍQUIDO DA NFS-e\s+Total do IBS/CBS[^\n]*\n([^\n]+)", txt_extraido
+  ):
+      valores_linha = re.findall(r"R\$\s*([\d.,]+)", m.group(1))
+      if len(valores_linha) >= 2:
+          vlr_total = parse_float(valores_linha[1])
+  if not vlr_total and (
+      m := re.search(r"VALOR DA OPERAÇÃO/SERVIÇO[^\n]*\n([^\n]+)", txt_extraido)
+  ):
+      valores_linha = re.findall(r"R\$\s*([\d.,]+)", m.group(1))
+      if valores_linha:
+          vlr_total = parse_float(valores_linha[0])
+
+  dados["itens"].append({
+      "descricao": descricao_limpa,
+      "und": "SV",
+      "qtd": 1.0,
+      "vlr_unit": vlr_total,
+      "vlr_total": vlr_total,
+  })
+
+  return dados
+
+
 def extrair_dados_pdf(caminho_pdf: Path) -> dict:
   """Função roteadora: extrai o texto base e direciona para a função correta."""
   txt_extraido = ""
   with pdfplumber.open(caminho_pdf) as pdf:
       for page in pdf.pages:
           txt_extraido += (page.extract_text() or "") + "\n"
-          
-  is_servico = "NOTA FISCAL DE SERVIÇO" in txt_extraido.upper() or "NFS-e" in txt_extraido
-  
-  if is_servico:
+
+  txt_upper = txt_extraido.upper()
+  is_danfse = "DANFSE" in txt_upper
+  is_servico = (
+      is_danfse
+      or "NOTA FISCAL DE SERVIÇO" in txt_upper
+      or "NFS-e" in txt_extraido
+  )
+
+  if is_danfse:
+      return extrair_dados_pdf_danfse(txt_extraido)
+  elif is_servico:
       return extrair_dados_pdf_servico(txt_extraido)
   else:
       return extrair_dados_pdf_produto(caminho_pdf, txt_extraido)

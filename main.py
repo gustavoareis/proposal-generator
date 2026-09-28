@@ -1,5 +1,9 @@
 import random
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -532,6 +536,177 @@ def preencher_word(
   doc.save(output_path)
 
 
+# --- PDF Consolidado ---
+def localizar_libreoffice() -> str | None:
+  """Localiza o executável do LibreOffice/soffice no PATH."""
+  for comando in ("libreoffice", "soffice"):
+    if caminho := shutil.which(comando):
+      return caminho
+  return None
+
+
+def localizar_word_windows() -> bool:
+  """Indica se estamos no Windows; a conversão usa o Microsoft Word via COM."""
+  return sys.platform == "win32"
+
+
+def converter_docx_para_pdf_com_word(docx_path: Path, pasta_saida: Path) -> Path:
+  """Converte DOCX para PDF usando o Microsoft Word instalado no Windows."""
+  try:
+    import pythoncom
+    import win32com.client
+  except ImportError as exc:
+    raise RuntimeError(
+        "Microsoft Word está disponível no Windows, mas a integração COM não está "
+        "instalada. Execute 'pip install pywin32'."
+    ) from exc
+
+  pdf_path = pasta_saida / f"{docx_path.stem}.pdf"
+  word = None
+  documento = None
+  pythoncom.CoInitialize()
+  try:
+    word = win32com.client.DispatchEx("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = 0
+    documento = word.Documents.Open(
+        str(docx_path.resolve()),
+        ReadOnly=True,
+        AddToRecentFiles=False,
+    )
+    # 17 = wdExportFormatPDF. Não dependemos do módulo win32com.client.constants.
+    documento.ExportAsFixedFormat(str(pdf_path.resolve()), 17)
+  except Exception as exc:
+    raise RuntimeError(
+        f"Não foi possível converter '{docx_path.name}' pelo Microsoft Word: {exc}"
+    ) from exc
+  finally:
+    if documento is not None:
+      try:
+        documento.Close(False)
+      except Exception:
+        pass
+    if word is not None:
+      try:
+        word.Quit()
+      except Exception:
+        pass
+    pythoncom.CoUninitialize()
+
+  if not pdf_path.exists():
+    raise RuntimeError(
+        f"O Microsoft Word não gerou o PDF esperado para '{docx_path.name}'."
+    )
+  return pdf_path
+
+
+def converter_docx_para_pdf_com_libreoffice(
+    docx_path: Path, pasta_saida: Path, libreoffice: str
+) -> Path:
+  """Converte um DOCX em PDF usando LibreOffice em modo headless."""
+  resultado = subprocess.run(
+      [
+          libreoffice,
+          "--headless",
+          "--convert-to",
+          "pdf",
+          "--outdir",
+          str(pasta_saida),
+          str(docx_path),
+      ],
+      capture_output=True,
+      text=True,
+      check=False,
+  )
+
+  pdf_path = pasta_saida / f"{docx_path.stem}.pdf"
+  if resultado.returncode != 0 or not pdf_path.exists():
+    detalhes = (resultado.stderr or resultado.stdout or "").strip()
+    raise RuntimeError(
+        f"Não foi possível converter '{docx_path.name}' para PDF pelo LibreOffice."
+        + (f" Detalhes: {detalhes}" if detalhes else "")
+    )
+
+  return pdf_path
+
+
+def converter_docx_para_pdf(docx_path: Path, pasta_saida: Path) -> Path:
+  """Escolhe automaticamente Word (Windows) ou LibreOffice como conversor."""
+  erros = []
+
+  if localizar_word_windows():
+    try:
+      return converter_docx_para_pdf_com_word(docx_path, pasta_saida)
+    except RuntimeError as exc:
+      erros.append(str(exc))
+
+  libreoffice = localizar_libreoffice()
+  if libreoffice:
+    try:
+      return converter_docx_para_pdf_com_libreoffice(
+          docx_path, pasta_saida, libreoffice
+      )
+    except RuntimeError as exc:
+      erros.append(str(exc))
+
+  if localizar_word_windows():
+    raise RuntimeError(
+        "Não foi possível converter o DOCX para PDF. No Windows, instale o "
+        "Microsoft Word e execute 'pip install pywin32'."
+        + (f" Detalhes: {' | '.join(erros)}" if erros else "")
+    )
+
+  raise RuntimeError(
+      "Não foi encontrado um conversor DOCX→PDF. Instale o LibreOffice e deixe "
+      "'libreoffice' ou 'soffice' no PATH, ou execute o programa em Windows com "
+      "Microsoft Word + 'pip install pywin32'."
+      + (f" Detalhes: {' | '.join(erros)}" if erros else "")
+  )
+
+
+def gerar_pdf_unico(propostas_docx: list[Path], output_path: Path) -> None:
+  """Gera um único PDF concatenando todas as propostas na ordem recebida."""
+  if not propostas_docx:
+    return
+
+  try:
+    from pypdf import PdfReader, PdfWriter
+  except ImportError as exc:
+    raise RuntimeError(
+        "A biblioteca 'pypdf' não está instalada. Execute 'pip install pypdf' "
+        "para habilitar a geração do PDF consolidado."
+    ) from exc
+
+  writer = PdfWriter()
+
+  with tempfile.TemporaryDirectory(prefix="propostas_pdf_") as temp_dir:
+    pasta_temp = Path(temp_dir)
+
+    for docx_path in propostas_docx:
+      pdf_path = converter_docx_para_pdf(docx_path, pasta_temp)
+      reader = PdfReader(str(pdf_path))
+      for page in reader.pages:
+        writer.add_page(page)
+
+  writer.add_metadata(
+      {
+          "/Title": "Propostas Comerciais Consolidadas",
+          "/Author": "Gerador de Propostas",
+      }
+  )
+
+  # Grava primeiro em arquivo temporário para não deixar o PDF anterior
+  # parcialmente sobrescrito caso a escrita falhe.
+  caminho_temporario = output_path.with_suffix(".tmp.pdf")
+  try:
+    with caminho_temporario.open("wb") as arquivo_pdf:
+      writer.write(arquivo_pdf)
+    caminho_temporario.replace(output_path)
+  finally:
+    if caminho_temporario.exists():
+      caminho_temporario.unlink()
+
+
 # --- Fluxo Principal ---
 def processar_notas():
   entrada, saida = Path("notas_entrada"), Path("propostas_saida")
@@ -549,10 +724,13 @@ def processar_notas():
     )
 
   saida.mkdir(exist_ok=True)
-  arquivos = list(entrada.glob("*.pdf"))
+  arquivos = sorted(entrada.glob("*.pdf"), key=lambda p: p.name.lower())
 
   if not arquivos:
     return print("Nenhum PDF encontrado em 'notas_entrada'.")
+
+  # Mantém a ordem exata das propostas geradas para montar o PDF consolidado.
+  propostas_docx = []
 
   for arquivo in arquivos:
     print(f"\n--- Processando: {arquivo.name} ---")
@@ -562,14 +740,16 @@ def processar_notas():
 
     if tpl_lc.exists():
       itens_lc, tot_lc = reajustar_valores(dados["itens"], 0.03)
+      caminho_lc = pasta_nf / f"LC COMERCIAL NF {dados['numero_nf']}.docx"
       preencher_word(
           tpl_lc,
-          pasta_nf / f"LC COMERCIAL NF {dados['numero_nf']}.docx",
+          caminho_lc,
           dados,
           itens_lc,
           tot_lc,
           is_jw=False,
       )
+      propostas_docx.append(caminho_lc)
       print(
           f"  ✓ LC criada (+3.0%) - Data:"
           f" {dados['data_emissao'].strftime('%d/%m/%Y')}"
@@ -578,18 +758,28 @@ def processar_notas():
     if tpl_jw.exists():
       margem_jw = random.uniform(0.05, 0.08)
       itens_jw, tot_jw = reajustar_valores(dados["itens"], margem_jw)
+      caminho_jw = pasta_nf / f"JW COMERCIAL NF {dados['numero_nf']}.docx"
       preencher_word(
           tpl_jw,
-          pasta_nf / f"JW COMERCIAL NF {dados['numero_nf']}.docx",
+          caminho_jw,
           dados,
           itens_jw,
           tot_jw,
           is_jw=True,
       )
+      propostas_docx.append(caminho_jw)
       print(
           f"  ✓ JW criada (+{margem_jw*100:.2f}%) - Data:"
           f" {dados['data_emissao'].strftime('%d/%m/%Y')}"
       )
+
+  if propostas_docx:
+    caminho_pdf_unico = saida / "TODAS AS PROPOSTAS.pdf"
+    try:
+      gerar_pdf_unico(propostas_docx, caminho_pdf_unico)
+      print(f"\n✓ PDF consolidado criado: {caminho_pdf_unico}")
+    except RuntimeError as exc:
+      print(f"\n⚠ Não foi possível gerar o PDF consolidado: {exc}")
 
 
 if __name__ == "__main__":

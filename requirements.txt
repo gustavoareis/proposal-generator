@@ -2,3 +2,5 @@ pdfplumber
 python-docx
 num2words
 holidays
+pypdf
+pywin32 pypdf

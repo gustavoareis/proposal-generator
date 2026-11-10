@@ -251,32 +251,36 @@ def extrair_dados_pdf_danfse(txt_extraido: str) -> dict:
       "obs": "",
   }
 
+  flags = re.IGNORECASE
+
   # 1. Número da NFS-e (primeiro valor da linha logo após o cabeçalho)
-  if m := re.search(r"NÚMERO DA NFS-E[^\n]*\n(\d+)", txt_extraido):
+  if m := re.search(r"N[ÚU]MERO DA NFS-e[^\n]*\n(\d+)", txt_extraido, flags):
       dados["numero_nf"] = m.group(1)
 
   # 2. Data de Emissão: a linha traz [número | competência | emissão | hora];
   # pegamos a data associada ao horário (emissão), não a da competência.
   if m := re.search(
-      r"NÚMERO DA NFS-E[^\n]*\n\d+\s+\d{2}/\d{2}/\d{4}\s+(\d{2}/\d{2}/\d{4})\s+\d{2}:\d{2}:\d{2}",
+      r"N[ÚU]MERO DA NFS-e[^\n]*\n\d+\s+\d{2}/\d{2}/\d{4}\s+(\d{2}/\d{2}/\d{4})\s*\d{2}:\d{2}:\d{2}",
       txt_extraido,
+      flags,
   ):
       dados["data_emissao"] = datetime.strptime(m.group(1), "%d/%m/%Y")
   elif m := re.search(r"(\d{2}/\d{2}/\d{4})", txt_extraido):
       dados["data_emissao"] = datetime.strptime(m.group(1), "%d/%m/%Y")
 
-  # 3. Município do documento, usado para "limpar" a linha de nome do tomador
-  # (nas colunas mescladas o município/UF/CEP ficam colados ao nome).
-  municipio_doc = ""
-  if m := re.search(r"Município:\s*([A-ZÀ-Ü\s]+/[A-Z]{2})", txt_extraido):
-      municipio_doc = m.group(1).strip()
+  # 3. Município do documento ("Município: Fortaleza - CE" ou "Fortaleza/CE"),
+  # usado para "limpar" a linha de nome do tomador (nas colunas mescladas o
+  # município/UF/CEP ficam colados ao nome).
+  cidade_doc, uf_doc = "", ""
+  if m := re.search(r"Munic[íi]pio:\s*(.+?)\s*[-/]\s*([A-Z]{2})\b", txt_extraido):
+      cidade_doc, uf_doc = m.group(1).strip(), m.group(2)
 
   # 4. Bloco do Tomador/Adquirente (CNPJ e Nome)
   bloco_tomador = ""
   if m := re.search(
-      r"TOMADOR/ADQUIRENTE(.*?)(?=DESTINATÁRIO DA OPERAÇÃO|SERVIÇO PRESTADO|$)",
+      r"TOMADOR\s*/\s*ADQUIRENTE(.*?)(?=DESTINAT[ÁA]RIO DA OPERA[ÇC][ÃA]O|SERVI[ÇC]O PRESTADO|$)",
       txt_extraido,
-      re.DOTALL,
+      re.DOTALL | flags,
   ):
       bloco_tomador = m.group(1)
 
@@ -285,38 +289,52 @@ def extrair_dados_pdf_danfse(txt_extraido: str) -> dict:
   ):
       dados["cnpj"] = m.group(1)
 
-  if m := re.search(r"Nome/Nome Empresarial[^\n]*\n([^\n]+)", bloco_tomador):
+  if m := re.search(r"Nome\s*/\s*Nome Empresarial[^\n]*\n([^\n]+)", bloco_tomador, flags):
       nome_linha = m.group(1).strip()
-      if municipio_doc and municipio_doc in nome_linha:
-          nome_linha = nome_linha.split(municipio_doc)[0].strip()
+      if cidade_doc and re.search(rf"\s+{re.escape(cidade_doc)}\s*/\s*{uf_doc}\b", nome_linha, flags):
+          nome_linha = re.split(
+              rf"\s+{re.escape(cidade_doc)}\s*/\s*{uf_doc}\b", nome_linha, flags=flags
+          )[0].strip()
       else:
-          nome_linha = re.sub(r"\s+\S+/[A-Z]{2}\s+[\d./\-]+$", "", nome_linha).strip()
+          nome_linha = re.sub(
+              r"\s+\S+\s*/\s*[A-Z]{2}\s+[\d.]+\s*/\s*[\d.\-]+$", "", nome_linha
+          ).strip()
       dados["cliente"] = nome_linha
 
   # 5. Descrição do Serviço (item único da nota)
   descricao_limpa = "PRESTAÇÃO DE SERVIÇOS"
   if m := re.search(
-      r"Descrição do Serviço\n(.*?)\nTRIBUTAÇÃO MUNICIPAL", txt_extraido, re.DOTALL
+      r"Descri[çc][ãa]o do Servi[çc]o\s*\n(.*?)\nTRIBUTA[ÇC][ÃA]O MUNICIPAL",
+      txt_extraido,
+      re.DOTALL | flags,
   ):
       descricao_bruta = re.sub(r"\s+", " ", m.group(1).replace("\n", " ")).strip()
       # Remove textos dinâmicos como "NO VALOR DE R$ 2.098,00" da descrição
       descricao_bruta = re.sub(
-          r"\s*NO VALOR DE R\$\s*[\d.,]+", "", descricao_bruta, flags=re.IGNORECASE
+          r"\s*NO VALOR(?:\s+DE)?\s*R\$\s*[\d.,]+", "", descricao_bruta, flags=re.IGNORECASE
       ).strip()
       if descricao_bruta:
           descricao_limpa = descricao_bruta
 
-  # 6. Valor Líquido da NFS-e (coluna 2 da linha de totais, entre os 4 valores
-  # de "Total das Retenções | VALOR LÍQUIDO DA NFS-e | Total do IBS/CBS | ...")
+  # 6. Valor Líquido da NFS-e. A linha de totais tem 4 colunas:
+  # "Total das Retenções | VALOR LÍQUIDO | Total do IBS/CBS | LÍQUIDO + IBS/CBS".
+  # Colunas vazias aparecem como "-", então tokenizamos a linha em vez de
+  # contar apenas os valores "R$" (que mudam de posição conforme as retenções).
   vlr_total = 0.0
   if m := re.search(
-      r"VALOR LÍQUIDO DA NFS-e\s+Total do IBS/CBS[^\n]*\n([^\n]+)", txt_extraido
+      r"VALOR L[ÍI]QUIDO DA NFS-e\s+Total do IBS/CBS[^\n]*\n([^\n]+)",
+      txt_extraido,
+      flags,
   ):
-      valores_linha = re.findall(r"R\$\s*([\d.,]+)", m.group(1))
-      if len(valores_linha) >= 2:
-          vlr_total = parse_float(valores_linha[1])
+      tokens = re.sub(r"R\$\s*", "", m.group(1)).split()
+      if len(tokens) >= 4:
+          vlr_total = parse_float(tokens[1])
+      else:
+          valores = re.findall(r"R\$\s*([\d.,]+)", m.group(1))
+          if valores:
+              vlr_total = parse_float(valores[0])
   if not vlr_total and (
-      m := re.search(r"VALOR DA OPERAÇÃO/SERVIÇO[^\n]*\n([^\n]+)", txt_extraido)
+      m := re.search(r"VALOR DA OPERA[ÇC][ÃA]O\s*/\s*SERVI[ÇC]O[^\n]*\n([^\n]+)", txt_extraido, flags)
   ):
       valores_linha = re.findall(r"R\$\s*([\d.,]+)", m.group(1))
       if valores_linha:
@@ -349,7 +367,13 @@ def extrair_dados_pdf(caminho_pdf: Path) -> dict:
   )
 
   if is_danfse:
-      return extrair_dados_pdf_danfse(txt_extraido)
+      # Alguns DANFSe saem do pdfplumber sem espaços entre as palavras
+      # ("NÚMERODANFS-e"). Reextrai com tolerância menor para recuperá-los.
+      with pdfplumber.open(caminho_pdf) as pdf:
+          txt_danfse = "\n".join(
+              (page.extract_text(x_tolerance=1.5) or "") for page in pdf.pages
+          )
+      return extrair_dados_pdf_danfse(txt_danfse)
   elif is_servico:
       return extrair_dados_pdf_servico(txt_extraido)
   else:

@@ -1,4 +1,3 @@
-import random
 import re
 import shutil
 import subprocess
@@ -14,6 +13,9 @@ from num2words import num2words
 import pdfplumber
 
 # --- Constantes ---
+PERCENTUAL_LC = 0.03
+PERCENTUAL_JW = 0.05
+
 MESES = [
     "",
     "JANEIRO",
@@ -146,7 +148,12 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
   if m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
     dados["cnpj"] = m.group(1).strip()
   if m := re.search(r"OBS:\s*([^\n]+)", txt_extraido, re.IGNORECASE):
-    dados["obs"] = m.group(1).strip()
+    dados["obs"] = re.sub(
+        r"\s*\.?\s*DOCUMENTO EMITIDO POR ME OU EPP OPTANTE PELO SIMPLES\b.*$",
+        "",
+        m.group(1).strip(),
+        flags=re.IGNORECASE,
+    ).strip()
 
   linhas = txt_extraido.split("\n")
   for i, linha in enumerate(linhas):
@@ -386,10 +393,7 @@ def reajustar_valores(itens: list, percentual: float) -> tuple[list, float]:
   novos_itens, soma = [], 0.0
 
   for i in itens:
-    fator = random.uniform(
-        1.0 + max(0.005, percentual - 0.02), 1.0 + percentual + 0.02
-    )
-    unit = round(i["vlr_unit"] * fator, 2)
+    unit = round(i["vlr_unit"] * (1 + percentual), 2)
     total = round(unit * i["qtd"], 2)
     novos_itens.append({**i, "vlr_unit": unit, "vlr_total": total})
     soma += total
@@ -763,7 +767,7 @@ def processar_notas():
     pasta_nf.mkdir(exist_ok=True)
 
     if tpl_lc.exists():
-      itens_lc, tot_lc = reajustar_valores(dados["itens"], 0.03)
+      itens_lc, tot_lc = reajustar_valores(dados["itens"], PERCENTUAL_LC)
       caminho_lc = pasta_nf / f"LC COMERCIAL NF {dados['numero_nf']}.docx"
       preencher_word(
           tpl_lc,
@@ -780,7 +784,7 @@ def processar_notas():
       )
 
     if tpl_jw.exists():
-      margem_jw = random.uniform(0.05, 0.08)
+      margem_jw = PERCENTUAL_JW
       itens_jw, tot_jw = reajustar_valores(dados["itens"], margem_jw)
       caminho_jw = pasta_nf / f"JW COMERCIAL NF {dados['numero_nf']}.docx"
       preencher_word(

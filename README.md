@@ -23,9 +23,9 @@ Para cada nota processada, o script pode gerar até dois documentos, dependendo 
 | Template | Arquivo gerado | Reajuste aplicado |
 |---|---|---|
 | `template_lc.docx` (ou `template.docx` como alternativa) | `LC COMERCIAL NF <numero>.docx` | +3,0% fixo |
-| `template_jw.docx` | `JW COMERCIAL NF <numero>.docx` | aleatório entre +5% e +8% |
+| `template_jw.docx` | `JW COMERCIAL NF <numero>.docx` | +5,0% fixo |
 
-- O reajuste é aplicado item a item com uma pequena variação aleatória entre eles, e o último item é ajustado para que o total bata exatamente com o valor-alvo (evita erros de arredondamento).
+- O mesmo percentual fixo é aplicado aos itens, e o último item é ajustado para que o total bata exatamente com o valor-alvo (evita erros de arredondamento).
 - No modelo "JW", a tabela de itens é formatada inteiramente em negrito; nos demais, apenas o cabeçalho.
 
 ## Tipos de nota suportados
@@ -99,4 +99,4 @@ python main.py
 - Os valores monetários são interpretados no formato brasileiro (`1.234,56`).
 - Quando o pdfplumber mescla várias colunas numéricas em uma célula só, o script assume que o primeiro valor monetário encontrado é o correto.
 - Se nenhum template (`template*.docx` ou `template_jw.docx`) for encontrado, nenhum documento é gerado para aquela nota — mas o script não avisa isso explicitamente, apenas não imprime a confirmação de criação.
-- Os percentuais de reajuste (3% fixo e faixa de 5–8%) estão fixos no código; para alterá-los, edite os parâmetros passados para `reajustar_valores` em `processar_notas()`.
+- Os percentuais de reajuste (3% para LC e 5% para JW) estão definidos pelas constantes `PERCENTUAL_LC` e `PERCENTUAL_JW` em `main.py`.

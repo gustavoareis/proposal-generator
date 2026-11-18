@@ -107,9 +107,83 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
   }
   
   # Extração de tabelas
+  itens_encontrados = {}
   with pdfplumber.open(caminho_pdf) as pdf:
     for page in pdf.pages:
       for table in page.extract_tables():
+        if not table:
+          continue
+
+        header_index = next(
+            (
+                i
+                for i, row in enumerate(table)
+                if row and any(
+                    "DESCRIÇÃO DO PRODUTO" in str(c or "").upper()
+                    for c in row
+                )
+            ),
+            None,
+        )
+        if header_index is not None:
+          header_row = table[header_index]
+          headers = [str(c or "").upper() for c in header_row]
+          desc_col = next((i for i, h in enumerate(headers) if "DESCRIÇÃO" in h), 0)
+          qtd_col = next((i for i, h in enumerate(headers) if "QTD" in h), None)
+          unit_col = next((i for i, h in enumerate(headers) if "VLR UNIT" in h or "VL. UNIT" in h), None)
+          total_col = next((i for i, h in enumerate(headers) if "VLR TOTAL" in h or "VL. TOTAL" in h), None)
+
+          if qtd_col is not None and unit_col is not None and total_col is not None:
+            for row in table[header_index + 1:]:
+              if not row or desc_col >= len(row):
+                continue
+              descricao_bruta = str(row[desc_col] or "").strip()
+              codigo = re.match(r"^(\d{10,})\s*-\s*", descricao_bruta)
+              if not codigo:
+                continue
+
+              descricao = re.sub(r"^\d{10,}\s*-\s*", "", descricao_bruta)
+              descricao = re.sub(r"\n*\s*\[NCM\s+\d+\]\s*$", "", descricao, flags=re.IGNORECASE)
+              descricao = re.sub(r"\n+", " ", descricao)
+              descricao = re.sub(r"\s+", " ", descricao).strip()
+              if not descricao:
+                continue
+
+              qtd_txt = str(row[qtd_col] or "")
+              unit_txt = str(row[unit_col] or "")
+              total_txt = str(row[total_col] or "")
+
+              compact_qtd = re.sub(r"[.\s]", "", qtd_txt)
+              qtd_match = re.search(r"-?\d+,\d+", compact_qtd)
+              qtd = parse_float(qtd_match.group(0)) if qtd_match else parse_float(qtd_txt)
+
+              compact_unit = re.sub(r"[.\s]", "", unit_txt)
+              compact_total = re.sub(r"[.\s]", "", total_txt)
+              vlr_unit = parse_float(
+                  re.search(r"-?\d+,\d+", compact_unit).group(0)
+                  if re.search(r"-?\d+,\d+", compact_unit)
+                  else unit_txt
+              )
+              total_match = re.search(r"-?\d+,\d+", compact_total)
+              vlr_total = parse_float(total_match.group(0) if total_match else total_txt)
+
+              und_match = re.search(r"\b(UN|UNID|ME|MT|PA|PC|KG|M)\b", qtd_txt, re.IGNORECASE)
+              und = und_match.group(1).upper() if und_match else ""
+              if not und:
+                compact_letters = re.sub(r"[\.\s\[\]]", "", qtd_txt)
+                und_match = re.search(r"(UN|ME|MT|PA|PC|KG)$", compact_letters, re.IGNORECASE)
+                und = und_match.group(1).upper() if und_match else "UN"
+
+              chave = f"{codigo.group(1)}|{descricao}|{qtd}|{vlr_unit}|{vlr_total}"
+              if chave not in itens_encontrados:
+                itens_encontrados[chave] = {
+                    "descricao": descricao,
+                    "und": und,
+                    "qtd": qtd,
+                    "vlr_unit": vlr_unit,
+                    "vlr_total": vlr_total,
+                }
+
         for row in table:
           if row and len(row) >= 9 and parece_codigo_item(row[0]):
             try:
@@ -126,6 +200,9 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
               })
             except (ValueError, TypeError):
               continue
+
+  if itens_encontrados:
+    dados["itens"] = list(itens_encontrados.values())
 
   # Extração de cabeçalho via Regex
   if m := re.search(r"Nº[:\s]*([\d.]+)", txt_extraido):
@@ -145,7 +222,27 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
   if not data_encontrada and (m := re.search(r"\d{2}/\d{2}/\d{4}", txt_extraido)):
     dados["data_emissao"] = datetime.strptime(m.group(0), "%d/%m/%Y")
 
-  if m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
+  bloco_destinatario = ""
+  if m := re.search(
+      r"DESTINAT[ÁA]RIO\s*/\s*REMETENTE(.*?)(?=TOTAL DOS|C[ÁA]LCULO DO IMPOSTO|FATURA|TRANSPORTADOR|DADOS ADICIONAIS|$)",
+      txt_extraido,
+      re.DOTALL | re.IGNORECASE,
+  ):
+    bloco_destinatario = m.group(1)
+
+  cnpjs_destinatario = re.findall(
+      r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}",
+      bloco_destinatario,
+  )
+  if cnpjs_destinatario:
+    dados["cnpj"] = cnpjs_destinatario[0]
+  elif m := re.search(
+      r"CNPJ\s*/\s*CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})",
+      txt_extraido,
+      re.IGNORECASE,
+  ):
+    dados["cnpj"] = m.group(1)
+  elif m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
     dados["cnpj"] = m.group(1).strip()
   if m := re.search(r"OBS:\s*([^\n]+)", txt_extraido, re.IGNORECASE):
     dados["obs"] = re.sub(
@@ -156,6 +253,20 @@ def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
     ).strip()
 
   linhas = txt_extraido.split("\n")
+  if bloco_destinatario:
+    if m := re.search(
+        r"NOME\s*/\s*RAZ[ÃA]O\s+SOCIAL[^\n]*\n([^\n]+)",
+        bloco_destinatario,
+        re.IGNORECASE,
+    ):
+      nome_linha = m.group(1).strip()
+      nome_linha = re.split(
+          r"\s+\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}",
+          nome_linha,
+          maxsplit=1,
+      )[0].strip()
+      dados["cliente"] = nome_linha
+
   for i, linha in enumerate(linhas):
     if "NOME/RAZÃO SOCIAL" in linha:
       resto = linha.split("NOME/RAZÃO SOCIAL")[-1].strip()
